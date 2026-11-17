@@ -1,22 +1,37 @@
-const cache = new Map();
-const pending = new Map();
-export async function get(path) {
-  const url = `https://make.fun/api${path}`;
-  const old = cache.get(url);
-  if (old && Date.now() - old.time < 60000) return old.data;
-  if (pending.has(url)) return pending.get(url);
-  const promise = (async () => {
-    const response = await fetch(url, { method: 'GET', headers: old?.etag ? { 'If-None-Match': old.etag } : {}, signal: AbortSignal.timeout(20000) });
-    if (response.status === 304 && old) { old.time = Date.now(); return old.data; }
-    if (!response.ok) throw new Error(response.status === 404 ? 'This page could not be found.' : `The live API returned ${response.status}.`);
-    const data = await response.json();
-    cache.set(url, { data, etag: response.headers.get('ETag'), time: Date.now() });
-    return data;
-  })();
-  pending.set(url, promise);
-  try { return await promise; } finally { pending.delete(url); }
+const API = 'https://make.fun/api';
+export function createCache(ttl = 60000) { return {ttl, entries: new Map()}; }
+const cache = createCache();
+let serverOffset = 0, clockSynced = false;
+export async function revalidateWithEtag(path, signal) {
+  const old = cache.entries.get(path);
+  if (old && Date.now() - old.at < cache.ttl) return old.data;
+  const response = await fetch(API + path, {signal, headers: old?.etag ? {'If-None-Match': old.etag} : {}});
+  const timestamp = Date.parse(response.headers.get('date'));
+  if (!clockSynced && Number.isFinite(timestamp)) { serverOffset = timestamp - Date.now(); clockSynced = true; }
+  if (response.status === 304 && old) { old.at = Date.now(); return old.data; }
+  if (!response.ok) throw new Error(response.status === 404 ? 'Unknown bounty or maker' : `Live API returned ${response.status}`);
+  const data = await response.json();
+  cache.entries.set(path, {data, at: Date.now(), etag: response.headers.get('etag')});
+  return data;
 }
-export const getBounties = () => get('/competitions?status=open&activity=times');
-export const getBounty = slug => get(`/competitions/${encodeURIComponent(slug)}`);
-export const getLeaderboard = slug => get(`/competitions/${encodeURIComponent(slug)}/leaderboard`);
-export const getProfile = handle => get(`/profiles/${encodeURIComponent(handle)}`);
+// Follow server cursors, then let views slice the complete cached list.
+async function collectPages(path, key, signal) {
+  let cursor, first, rows = [];
+  const seen = new Set();
+  do {
+    const data = await revalidateWithEtag(path + (path.includes('?') ? '&' : '?') + 'limit=100' + (cursor ? '&cursor=' + encodeURIComponent(cursor) : ''), signal);
+    first ??= data;
+    const batch = Array.isArray(data) ? data : data[key] ?? data.items ?? [];
+    if (!Array.isArray(batch)) throw new Error('Unexpected API list response');
+    rows.push(...batch);
+    cursor = data.next_cursor;
+    if (cursor && seen.has(cursor)) throw new Error('API repeated a pagination cursor');
+    seen.add(cursor);
+  } while (cursor);
+  return {...first, [key]: rows, next_cursor: null};
+}
+export const getBounties = signal => collectPages('/competitions?status=open&activity=times', 'competitions', signal);
+export const getBounty = (slug, signal) => revalidateWithEtag(`/competitions/${encodeURIComponent(slug)}`, signal);
+export const getLeaderboard = (slug, signal) => collectPages(`/competitions/${encodeURIComponent(slug)}/leaderboard`, 'entries', signal);
+export const getProfile = (handle, signal) => revalidateWithEtag(`/profiles/${encodeURIComponent(handle)}`, signal);
+export const getServerNow = () => Date.now() + serverOffset;
